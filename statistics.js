@@ -13,7 +13,7 @@ const debugDir = path.join(process.cwd(), "debug-keys");
 const statisticsDir = path.join(process.cwd(), "statistics");
 
 const client = new EsClient({
-  node: "https://44.207.13.212:9200/",
+  node: "no node",
   requestTimeout: 60 * 60 * 1000,
   pingTimeout: 60 * 60 * 1000,
   auth: {
