@@ -12,6 +12,32 @@ import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 const debugDir = path.join(process.cwd(), "debug-keys");
 const statisticsDir = path.join(process.cwd(), "statistics");
 
+const client = new EsClient({
+  node: "https://44.207.13.212:9200/",
+  requestTimeout: 60 * 60 * 1000,
+  pingTimeout: 60 * 60 * 1000,
+  auth: {
+    username: "no username",
+    password: "no password",
+  },
+  tls: { rejectUnauthorized: false },
+});
+
+const s3 = new S3Client({
+  region: "us-east-1",
+  credentials: {
+    accessKeyId: "no access key",
+    secretAccessKey: "no secret key",
+  },
+});
+
+const sqs = new SQSClient({
+  region: "us-east-1",
+  credentials: {
+    accessKeyId: "no access key",
+    secretAccessKey: "no secret key",
+  },
+});
 const QUEUES = {
   welldyne: process.env.WELLDYNE_SQS_URL,
 };
