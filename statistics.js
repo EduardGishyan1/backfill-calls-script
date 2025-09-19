@@ -3,6 +3,9 @@ import fs from "fs";
 import { Client as EsClient } from "@elastic/elasticsearch";
 import { S3Client, ListObjectsV2Command } from "@aws-sdk/client-s3";
 
+const debugDir = path.join(process.cwd(), "debug-keys");
+const statisticsDir = path.join(process.cwd(), "statistics");
+
 
 let RESUME_AFTER = null;
 const MAX_RESTARTS = 10;
@@ -11,6 +14,7 @@ let restartCount = 0;
 const transcriptIds = new Set();
 
 const transcriptKeys = new Set();
+const transcriptKeysWithContact = new Set();
 const transcriptKeysWithEval = new Set();
 
 const S3_BUCKET = "supervize-internal-calls";
@@ -92,10 +96,13 @@ const FILTERS = {
   clientId: "welldyne",
   from: "2025-08-05T00:00:00Z",
   to: "2025-08-05T23:59:59Z",
+  limit: 100,
 };
 
+fs.mkdirSync(statisticsDir, { recursive: true });
+
 const OUTPUT = {
-  jsonlPath: path.join(process.cwd(), `hello-report-${Date.now()}.jsonl`),
+  jsonlPath: path.join(statisticsDir, `hello-report-${Date.now()}.jsonl`),
   writeFile: true,
 };
 
@@ -444,6 +451,9 @@ async function run() {
         }
 
         const contactId = contact._source?.id;
+
+        if (tPath) transcriptKeysWithContact.add(tPath);
+
         const evals = await findEvaluationsByContactId(contactId);
 
         if (evals.length === 0) {
@@ -551,60 +561,39 @@ async function run() {
     } catch {}
   }
 
-  let s3Coverage = null;
+  let summaryFields = {
+    countS3Files: 0,
+    countTranscripts: transcriptKeys.size,
+    transcriptsMatchS3: 0,
+    NotEvalOrContact: 0,
+    OK: 0,
+  };
+
   try {
-    const s3Enabled = S3_BUCKET && !S3_BUCKET.startsWith("<");
-    if (s3Enabled) {
-      const s3KeysArr = Array.from(s3Keys);
+    const s3KeysArr = Array.from(s3Keys);
+    const s3HasTranscriptKeys = s3KeysArr.filter((k) => transcriptKeys.has(k));
+    const s3HasTranscriptAndEvalKeys = s3HasTranscriptKeys.filter((k) => transcriptKeysWithEval.has(k));
+    const s3HasTranscriptNoContactKeys = s3HasTranscriptKeys.filter((k) => !transcriptKeysWithContact.has(k));
+    const s3HasTranscriptWithContactNoEvalKeys = s3HasTranscriptKeys.filter(
+      (k) => transcriptKeysWithContact.has(k) && !transcriptKeysWithEval.has(k)
+    );
 
-      const s3HasTranscriptKeys = s3KeysArr.filter((k) => transcriptKeys.has(k));
-      const s3HasTranscriptAndEvalKeys = s3HasTranscriptKeys.filter((k) => transcriptKeysWithEval.has(k));
-      const s3HasTranscriptNoEvalKeys = s3HasTranscriptKeys.filter((k) => !transcriptKeysWithEval.has(k));
-      const s3NoTranscriptKeys = s3KeysArr.filter((k) => !transcriptKeys.has(k));
+    summaryFields = {
+      countS3Files: s3Keys.size,
+      countTranscripts: transcriptKeys.size,
+      transcriptsMatchS3: s3HasTranscriptKeys.length,
+      NotEvalOrContact: s3HasTranscriptNoContactKeys.length + s3HasTranscriptWithContactNoEvalKeys.length,
+      OK: s3HasTranscriptAndEvalKeys.length,
+    };
 
-      const transcriptsOutsideS3 = Array.from(transcriptKeys).filter((k) => !s3Keys.has(k));
-
-      s3Coverage = {
-        bucket: S3_BUCKET,
-        client: FILTERS.clientId,
-        range: { from: FILTERS.from, to: FILTERS.to },
-
-        s3Total: s3Keys.size,
-        s3HasTranscript: s3HasTranscriptKeys.length,
-        s3HasTranscriptAndEval: s3HasTranscriptAndEvalKeys.length,
-        s3HasTranscriptNoEval: s3HasTranscriptNoEvalKeys.length,
-        s3NoTranscript: s3NoTranscriptKeys.length,
-
-        transcriptKeysTotal: transcriptKeys.size,
-        transcriptKeysWithEvalTotal: transcriptKeysWithEval.size,
-        transcriptsOutsideS3: transcriptsOutsideS3.length,
-
-        sample_s3HasTranscript: s3HasTranscriptKeys.slice(0, 5),
-        sample_s3HasTranscriptAndEval: s3HasTranscriptAndEvalKeys.slice(0, 5),
-        sample_s3HasTranscriptNoEval: s3HasTranscriptNoEvalKeys.slice(0, 5),
-        sample_s3NoTranscript: s3NoTranscriptKeys.slice(0, 5),
-        sample_transcriptsOutsideS3: transcriptsOutsideS3.slice(0, 5),
-      };
-    }
+    console.log(JSON.stringify({ QUICK_SUMMARY: summaryFields }));
   } catch (e) {
-    console.warn("Failed to compute S3 coverage:", e?.message || e);
+    console.warn("Failed to compute summary fields:", e?.message || e);
   }
 
-  const summary = {
-    SUMMARY: {
-      scannedTranscripts: counters.scannedTranscripts,
-      ok: counters.ok,
-      missingContact: counters.missingContact,
-      missingEvaluation: counters.missingEvaluation,
-      duplicateContacts: counters.duplicateContacts,
-      duplicateEvaluations: counters.duplicateEvaluations,
-      mismatch: counters.mismatch,
-      outputFile: OUTPUT.writeFile ? OUTPUT.jsonlPath : null,
-      planUsed: PLAN,
-      s3Coverage,
-    },
-  };
+  const summary = { SUMMARY: summaryFields };
   if (OUTPUT.writeFile) fs.appendFileSync(OUTPUT.jsonlPath, jline(summary) + "\n");
+  console.log(jline(summary));
 }
 
 run().catch((err) => {
