@@ -1,25 +1,89 @@
 import path from "path";
 import fs from "fs";
 import { Client as EsClient } from "@elastic/elasticsearch";
-import { S3Client, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import {
+  S3Client,
+  ListObjectsV2Command,
+  GetObjectCommand,
+  PutObjectCommand,
+} from "@aws-sdk/client-s3";
+import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 
 const debugDir = path.join(process.cwd(), "debug-keys");
 const statisticsDir = path.join(process.cwd(), "statistics");
 
-
-let RESUME_AFTER = null;
-const MAX_RESTARTS = 10;
-let restartCount = 0;
-
-const transcriptIds = new Set();
-
-const transcriptKeys = new Set();
-const transcriptKeysWithContact = new Set();
-const transcriptKeysWithEval = new Set();
+const QUEUES = {
+  welldyne: process.env.WELLDYNE_SQS_URL,
+};
 
 const S3_BUCKET = "supervize-internal-calls";
 
+const OVERWRITE_ORPHANS = true;
+const MAX_OVERWRITES   = 500;
+const DRY_RUN          = false;
+const PUSH_MISSING_TO_SQS = true; 
+
 const z2 = (n) => String(n).padStart(2, "0");
+
+function isFifo(url) {
+  return !!url && url.endsWith(".fifo");
+}
+
+async function pushMissingEvalToSQS({
+  clientId,
+  contactId,
+  recordingPath,
+  transcriptId,
+  reason = "MISSING_EVALUATION",
+}) {
+  if (!PUSH_MISSING_TO_SQS) return;
+  if (!clientId) {
+    console.warn("[SQS] Skip push: no clientId");
+    return;
+  }
+  const queueUrl = QUEUES[clientId];
+  if (!queueUrl || queueUrl.startsWith("<PUT_")) {
+    console.warn("[SQS] Skip push: queue URL not configured for", clientId);
+    return;
+  }
+
+  const body = {
+    clientId,
+    contactId,
+    recordingPath,
+    transcriptId,
+    reason,
+    ts: Date.now(),
+  };
+
+  const params = {
+    QueueUrl: queueUrl,
+    MessageBody: JSON.stringify(body),
+  };
+
+  if (isFifo(queueUrl)) {
+    params.MessageGroupId = clientId;
+    params.MessageDeduplicationId =
+      (contactId || transcriptId || `${clientId}:${recordingPath || ""}`) +
+      `:${new Date().toISOString().slice(0, 13)}`;
+  }
+
+  if (DRY_RUN) {
+    console.log("[DRY_RUN][SQS] Would send:", params);
+    return;
+  }
+
+  try {
+    const res = await sqs.send(new SendMessageCommand(params));
+    console.log("[SQS] Sent missing-eval message", {
+      messageId: res.MessageId,
+      contactId,
+      transcriptId,
+    });
+  } catch (e) {
+    console.warn("[SQS] Failed to send:", e?.message || e);
+  }
+}
 
 async function listKeysForPrefix({ bucket, prefix }) {
   let ContinuationToken;
@@ -59,6 +123,10 @@ async function listS3KeysForRange({ bucket, client, from, to }) {
   return all;
 }
 
+let RESUME_AFTER = null;
+const MAX_RESTARTS = 10;
+let restartCount = 0;
+
 function updateResumeCursorFromHit(hit) {
   const src = hit?._source || {};
   const lastDate = src?.[PLAN.dateField];
@@ -96,7 +164,7 @@ const FILTERS = {
   clientId: "welldyne",
   from: "2025-08-05T00:00:00Z",
   to: "2025-08-05T23:59:59Z",
-  limit: 100,
+  limit: 10,
 };
 
 fs.mkdirSync(statisticsDir, { recursive: true });
@@ -333,6 +401,48 @@ function asSummaryLine(kind, payload) {
   };
 }
 
+async function overwriteSameKey(bucket, key) {
+  if (DRY_RUN) {
+    console.log(`[DRY_RUN] Would overwrite same key: s3://${bucket}/${key}`);
+    return;
+  }
+  const getRes = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const body = await streamToBuffer(getRes.Body);
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: body,
+      ContentType: getRes.ContentType,
+      Metadata: getRes.Metadata,
+    })
+  );
+
+  console.log(`[OVERWRITE] Re-uploaded ${key} to same key (ObjectCreated:Put).`);
+}
+
+function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    if (stream && typeof stream.on === "function") {
+      const chunks = [];
+      stream.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      stream.on("end", () => resolve(Buffer.concat(chunks)));
+      stream.on("error", reject);
+      return;
+    }
+    if (stream && typeof stream.arrayBuffer === "function") {
+      stream
+        .arrayBuffer()
+        .then((ab) => resolve(Buffer.from(ab)))
+        .catch(reject);
+      return;
+    }
+    if (Buffer.isBuffer(stream)) return resolve(stream);
+    reject(new Error("Unsupported GetObject Body type"));
+  });
+}
+
 async function run() {
   const out = OUTPUT.writeFile ? fs.createWriteStream(OUTPUT.jsonlPath, { flags: "a" }) : null;
   const write = (obj) => {
@@ -362,6 +472,11 @@ async function run() {
   } else {
     console.warn("S3_BUCKET not set; skipping S3 coverage.");
   }
+
+  const transcriptIds = new Set();
+  const transcriptKeys = new Set();
+  const transcriptKeysWithContact = new Set();
+  const transcriptKeysWithEval = new Set();
 
   const counters = {
     scannedTranscripts: 0,
@@ -458,6 +573,15 @@ async function run() {
 
         if (evals.length === 0) {
           counters.missingEvaluation += 1;
+
+          await pushMissingEvalToSQS({
+            clientId: tClientId,
+            contactId: (contact && contact._source && contact._source.id) || null,
+            recordingPath: tPath,
+            transcriptId: tid || null,
+            reason: "MISSING_EVALUATION",
+          });
+
           write(
             asSummaryLine("MISSING_EVALUATION", {
               tid,
@@ -571,12 +695,32 @@ async function run() {
 
   try {
     const s3KeysArr = Array.from(s3Keys);
+
     const s3HasTranscriptKeys = s3KeysArr.filter((k) => transcriptKeys.has(k));
+    const s3NoTranscriptKeys  = s3KeysArr.filter((k) => !transcriptKeys.has(k));
+
     const s3HasTranscriptAndEvalKeys = s3HasTranscriptKeys.filter((k) => transcriptKeysWithEval.has(k));
     const s3HasTranscriptNoContactKeys = s3HasTranscriptKeys.filter((k) => !transcriptKeysWithContact.has(k));
     const s3HasTranscriptWithContactNoEvalKeys = s3HasTranscriptKeys.filter(
       (k) => transcriptKeysWithContact.has(k) && !transcriptKeysWithEval.has(k)
     );
+
+    if (OVERWRITE_ORPHANS) {
+      let done = 0;
+      for (const key of s3NoTranscriptKeys) {
+        if (done >= MAX_OVERWRITES) {
+          console.warn(`[OVERWRITE] Hit MAX_OVERWRITES=${MAX_OVERWRITES}; stopping.`);
+          break;
+        }
+        try {
+          await overwriteSameKey(S3_BUCKET, key);
+          done += 1;
+        } catch (e) {
+          console.warn(`[OVERWRITE] Failed for ${key}:`, e?.message || e);
+        }
+      }
+      console.log(`[OVERWRITE] Completed ${done} same-key overwrites.`);
+    }
 
     summaryFields = {
       countS3Files: s3Keys.size,
